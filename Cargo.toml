@@ -1,0 +1,18 @@
+[package]
+name = "greyhound"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Pointing to your local clone of the ICICLE repository
+icicle-runtime = { git = "https://github.com/ingonyama-zk/icicle.git", branch="main" }
+icicle-core = { git = "https://github.com/ingonyama-zk/icicle.git", branch="main" }
+icicle-babykoala = { git = "https://github.com/ingonyama-zk/icicle.git", branch="main" }
+# Essential crates for CLI parsing and random sampling
+clap = { version = "4.4", features = ["derive"] }
+rand = "0.8.5"
+
+# Fiat-Shamir and underlying algebraic dependencies
+spongefish = { git = "https://github.com/arkworks-rs/spongefish" }
+ark-ec = "0.4.0"
+ark-std = "0.4.0"
