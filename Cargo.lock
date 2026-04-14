@@ -365,6 +365,7 @@ dependencies = [
  "icicle-core",
  "icicle-runtime",
  "rand 0.8.5",
+ "rand_chacha",
  "spongefish",
 ]
 

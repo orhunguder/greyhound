@@ -11,6 +11,7 @@ icicle-babykoala = { git = "https://github.com/ingonyama-zk/icicle.git", branch=
 # Essential crates for CLI parsing and random sampling
 clap = { version = "4.4", features = ["derive"] }
 rand = "0.8.5"
+rand_chacha = "0.3"
 
 # Fiat-Shamir and underlying algebraic dependencies
 spongefish = { git = "https://github.com/arkworks-rs/spongefish" }

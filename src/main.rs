@@ -1,6 +1,7 @@
+#![allow(non_snake_case)]
 use icicle_core::{
     matrix_ops::{self, MatMulConfig},
-    vec_ops::{VecOpsConfig, poly_vecops},
+    vec_ops::{VecOpsConfig},
     traits::GenerateRandom,
     balanced_decomposition,
     negacyclic_ntt,
@@ -20,23 +21,18 @@ use icicle_runtime::{
 use spongefish::{
     protocol_id, DomainSeparator, ProverState, VerifierState,
 };
-use rand::RngCore;
+use rand::Rng;
+use std::time::Instant;
 
 // all the parameters in greyhound and their explanations, as specified in page 20 and 26-27-28 of the paper.
 // See Fig. 3 (20) and Table 4 (28).
 
 // q, the prime modulus. q ≡ 5 (mod 8).
-// should be a prime around 2^32
-// TODO
-// pub const q = ...
+// WARNING AND TODO! ICICLE babykoala q is 1 mod 8!!!!! This forgoes the security of lemma 2.1!
 
-// N, the degree bound on the polynomials
-// Can be 2^26, 2^28, 2^30 and possibly more.
-// For simplicity let us assume N = 2^30, and i can support more max sizes later.
-// ---- TEST PARAMETERS (small enough for 16GB RAM, fast in debug mode) ----
-// Production values: N=2^30, M=12625, R=1329, NROWS=18, N1=7, B0=4, DELTA0=8, B1=6, DELTA=5
-// TODO!!!!!!!!!!!! CHECK IF DELTA DELTA0 BEING TWICE AS BIG IS OKAY.
-// TODO!!!!!!!!!!!! USING DIFFERENT B VALUES BECAUSE OF DIFFERNET BABYKOALA MODULUS
+// TODO!!!!!!!!!!!! USING DIFFERENT B VALUES BECAUSE OF DIFFERNET BABYKOALA MODULUS!! The values on the whitepaper
+// are fine for q approx eq. to 2^32 but by the parameter selection secion, we have to have b0 b1 of at least 12-13.
+
 pub const N: usize = 67_108_864; // 2^26
 pub const M: usize = 3156;
 pub const R: usize = 333;
@@ -79,7 +75,6 @@ fn to_bytes<T: Copy>(device_vec: &DeviceVec<T>) -> Vec<u8> {
     }
     let mut host_vec = vec![unsafe { std::mem::zeroed() }; len];
     device_vec.copy_to_host(HostSlice::from_mut_slice(&mut host_vec)).unwrap();
-    // Reinterpret as bytes
     let byte_len = len * std::mem::size_of::<T>();
     let bytes = unsafe { std::slice::from_raw_parts(host_vec.as_ptr() as *const u8, byte_len) };
     bytes.to_vec()
@@ -106,14 +101,12 @@ fn poly_to_bytes(y_ring: &PolyRing) -> Vec<u8> {
     bytes.to_vec()
 }
 
-// HUMAN: Helpers look good
-
 impl FiatShamirGreyhound {
     pub fn protocol_id() -> [u8; 64] {
         protocol_id(core::format_args!("greyhound proof"))
     }
 
-    /// Evaluates the prover side using the sponge state.
+    // Evaluates the prover side using the sponge state.
     pub fn prove(
         prover_state: &mut ProverState,
         u: &Vec<PolyRing>,          // Public Commitment
@@ -144,8 +137,7 @@ impl FiatShamirGreyhound {
         let mut c_zq_dev = DeviceVec::<Zq>::device_malloc(R * d).unwrap();
         let cfg = VecOpsConfig::default();
 
-        // HUMAN: No idea what is going on here. Why didn't we just sample the random challenges
-        // on the device after getting the seed from the sponge? What is all this?
+        // TODO: NOT REALLY SURE ABOUT ALL THIS, RECHECK
         icicle_core::random_sampling::random_sampling(true, &seed, &cfg, &mut c_zq_dev[..]).unwrap();
         
         let mut c_zq_host = vec![Zq::zero(); R * d];
@@ -158,7 +150,7 @@ impl FiatShamirGreyhound {
         DeviceVec::from_host_slice(&c_host)
     }
 
-    /// Evaluates the verifier side using the sponge state.
+    // Evaluates the verifier side using the sponge state.
     pub fn verify(
         mut verifier_state: VerifierState,
         u: &Vec<PolyRing>, 
@@ -166,7 +158,7 @@ impl FiatShamirGreyhound {
         y: &PolyRing, 
         v: &DeviceVec<PolyRing>
     ) -> DeviceVec<PolyRing> {
-        // HUMAN: Are we sure about u8?
+        // TODO: IDK about u8?
         let ub = to_bytes_host(u);
         for _ in 0..ub.len() { verifier_state.prover_message::<[u8; 1]>().unwrap(); }
         let xb = zq_to_bytes(x);
@@ -181,7 +173,6 @@ impl FiatShamirGreyhound {
         let d = PolyRing::DEGREE;
         let mut c_zq_dev = DeviceVec::<Zq>::device_malloc(R * d).unwrap();
         let cfg = VecOpsConfig::default();
-        //HUMAN: Again, dont know what all this code does.
         icicle_core::random_sampling::random_sampling(true, &seed, &cfg, &mut c_zq_dev[..]).unwrap();
 
         let mut c_zq_host = vec![Zq::zero(); R * d];
@@ -195,7 +186,6 @@ impl FiatShamirGreyhound {
     }
 }
 
-//HUMAN: Looks good
 pub fn setup() -> PublicParams {
     // 1: A ← R_q^{n × δ₀·m}, note that in icicle matrices are one dimensional anyway only in matmult you can specify matrix dims
     let A_len = NROWS * DELTA0 * M;
@@ -206,7 +196,6 @@ pub fn setup() -> PublicParams {
     // 3: D ← R_q^{n × δ·r}
     let D_len = NROWS * DELTA * R;
     let D = DeviceVec::from_host_slice(&PolyRing::generate_random(D_len));
-    // 4: pp_1 ← S'(1^λ)   — Labrador setup, placeholder
     PublicParams { A, B, D }
 }
 // 2 - Commit function that will commit to the left side of the calculation a^T [s_1 | ... | s_r] and
@@ -222,17 +211,15 @@ pub fn commit(raw_f_coeffs: &[u64], pp: &PublicParams) -> Result<CommitReturn, I
     assert!(M * R >= (N + PolyRing::DEGREE - 1) / PolyRing::DEGREE, "m*r must be >= N/d");
     // Line 1: define the function. Function coeffs are already defined with our input f_coeffs. Convert to Zq.
 
-    //HUMAN: Note that coefficients of polynomial are assumed as u32 here. but looks good ow
+    //TODO: Note that coefficients of polynomial are assumed as u32 here. but looks good ow
 
     let f_coeffs: Vec<Zq> = raw_f_coeffs.iter().map(|&val| Zq::from(val as u32)).collect();
     let d = PolyRing::DEGREE;
     let cfg = VecOpsConfig::default();
-    let matcfg = MatMulConfig::default();
     // Lines 2-3: chunk the coeffs in groups of d. Create chunks of size d and map them each to a PolyRing.
     // we add zeros to the extra parts at the end if there are any. Notice that at this stage we have the polynomial
 	// coefficient matrix that is of size m x r. Each element in the matrix is a poly ring of degree d.
 
-    //HUMAN: Looks good.
 
     let mut f_poly: Vec<PolyRing> = f_coeffs
         .chunks(d)
@@ -252,9 +239,12 @@ pub fn commit(raw_f_coeffs: &[u64], pp: &PublicParams) -> Result<CommitReturn, I
     let ntt_cfg = negacyclic_ntt::NegacyclicNttConfig::default();
     
     // NTT transform A once for all s_i multiplications
+    // TODO: Ask whether I am doing NTT properly. This ntt transform SHOULD be faster than just matmul?
+
     let mut A_ntt = DeviceVec::<PolyRing>::device_malloc(pp.A.len())?;
     negacyclic_ntt::ntt(&pp.A, NTTDir::kForward, &ntt_cfg, &mut A_ntt[..])?;
 
+    let start_commit_loop = Instant::now();
     for i in 1..(R + 1) {
         let f_i: Vec<PolyRing> = f_poly[(i-1)*M..(i)*M].to_vec();
         let f_i_dev = DeviceVec::from_host_slice(&f_i);
@@ -299,10 +289,10 @@ pub fn commit(raw_f_coeffs: &[u64], pp: &PublicParams) -> Result<CommitReturn, I
         s_i.copy_to_host(HostSlice::from_mut_slice(&mut s_i_host))?;
         s_vecs.push(s_i_host);
     }
-
-    //HUMAN: Looks good so far.
+    println!("  [TIMER] Commit loop for R={} columns took: {:?}", R, start_commit_loop.elapsed());
 
     // NTT transform B and t_hat_concat for the final commitment u
+    let start_commit_final = Instant::now();
     let mut B_ntt = DeviceVec::<PolyRing>::device_malloc(pp.B.len())?;
     negacyclic_ntt::ntt(&pp.B, NTTDir::kForward, &ntt_cfg, &mut B_ntt[..])?;
 
@@ -324,6 +314,7 @@ pub fn commit(raw_f_coeffs: &[u64], pp: &PublicParams) -> Result<CommitReturn, I
 
     let mut t_hat_concat_host = vec![PolyRing::zero(); t_hat_total_len];
     t_hat_concat_dev.copy_to_host(HostSlice::from_mut_slice(&mut t_hat_concat_host))?;
+    println!("  [TIMER] Commit final NTTs & Matmul took: {:?}", start_commit_final.elapsed());
 
     Ok(CommitReturn {
         u: u_host,
@@ -331,18 +322,12 @@ pub fn commit(raw_f_coeffs: &[u64], pp: &PublicParams) -> Result<CommitReturn, I
         t_hat_concat: t_hat_concat_host,
     })
 }
-// 3 - Eval function for prover. We will simulate the verifier challenges using fiat shamir transform. 
+// Eval function for prover. We will simulate the verifier challenges using fiat shamir transform. 
 // to do this, I will use https://github.com/arkworks-rs/spongefish. I will feed into the sha3 hash function these:
 // the name of the protocol, the statement, commitment, every message sent and received including the challenges.
 // obviously the secret should not be in the hash. After getting these, I will just continue on with the eval.
 // Note that this function still needs 1 interaction from V, that is, the value of x, the eval point
 // of the polynomial.
-
-// 4 - Send value x function for verifier. All it does is send an eval point x to the prover.
-
-// 5 - Eval fucntion for Verifier. Since we are implementing fiat shamir transform, Lines 1-5 in the figure are replaced
-// with just checking that the challenges in the transcript are correct. After this, verifier should believe values
-// P, h,  and gamma are calculated honestly and just run a labrador subprotocol.
 
 // -------------------------------------------------------------------------------------------------
 // PROVER EVALUATION
@@ -353,8 +338,6 @@ pub struct ProverProof {
     pub v: Vec<PolyRing>,
     // The Fiat-Shamir proof transcript sequence of bytes
     pub narg_transcript: Vec<u8>,
-    // z = [s_1 | ... | s_r] * c
-    pub z: Vec<PolyRing>,
     // Labrador proof and transcript
     pub labrador_proof: labrador::LabradorProof,
     pub labrador_transcript: Vec<u8>,
@@ -372,21 +355,7 @@ fn evaluate_polynomial(f_coeffs: &[Zq], x: &Zq) -> Zq {
     y
 }
 
-/// Embed a scalar evaluation point x into the polynomial ring.
-/// Returns the PolyRing element whose coefficients are [1, x, x², ..., x^{d-1}].
-fn embed_scalar_point(x: &Zq) -> PolyRing {
-    let d = PolyRing::DEGREE;
-    let mut coeffs = vec![Zq::zero(); d];
-    let mut x_pow = Zq::one();
-    for i in 0..d {
-        coeffs[i] = x_pow;
-        x_pow = x_pow * *x;
-    }
-    PolyRing::from_slice(&coeffs).unwrap()
-}
-
 /// Extract the constant term of a PolyRing element as a Zq scalar.
-// HUMAN: WTF??????? WHAT IS THIS? DOES THIS REALLY WORK
 fn constant_term(y: &PolyRing) -> Zq {
     let bytes = unsafe {
         std::slice::from_raw_parts(y as *const _ as *const Zq, PolyRing::DEGREE)
@@ -398,7 +367,7 @@ pub fn eval_prover(
     pp: &PublicParams,
     raw_f_coeffs: &[u64],
     commit_return: &CommitReturn,
-    x_scalar: &Zq,
+    x_scalar: &Zq, //the value of eval point x
     lab_crs: &labrador::LabradorCRS,
 ) -> Result<ProverProof, IcicleError> {
     // convert raw f coeffs into zq elements
@@ -407,9 +376,9 @@ pub fn eval_prover(
     let cfg = VecOpsConfig::default();
     let matcfg = MatMulConfig::default();
 
-    // --- Eval.P lines 1-5: Evaluate Polynomial ---
+    // Lines 1-5
     
-    // 1. Construct powers of x: [1, x, x^2, ..., x^{d-1}]
+    // Construct powers of x: [1, x, x^2, ..., x^{d-1}]
     let mut x_powers = vec![Zq::zero(); d];
     let mut curr_x = Zq::one();
     for j in 0..d {
@@ -420,19 +389,23 @@ pub fn eval_prover(
 
     // 2. Apply the Galois Automorphism σ_{-1}(x)
     // This maps coefficients [a_0, a_1, ..., a_{d-1}] to [a_0, -a_{d-1}, -a_{d-2}, ..., -a_1]
+    // Please see my interim report for the mathematics explanation. But the point is that automorphism on negacyclic
+    // rings such as the one we are using can be efficiently calculated using this formula.
     let mut sigma_x_coeffs = vec![Zq::zero(); d];
     sigma_x_coeffs[0] = x_powers[0];
     for j in 1..d {
         // Subtract from zero to negate in Zq
         sigma_x_coeffs[j] = Zq::zero() - x_powers[d - j]; 
     }
+    // this is the sigma_{-1} in line 5
     let sigma_inv_x = PolyRing::from_slice(&sigma_x_coeffs).unwrap();
 
-    // 3. Compute y = Σ σ_{-1}(x) * f_i * (x^d)^i
+    // Line 5: Compute y = Σ σ_{-1}(x) * f_i * (x^d)^i
     let mut y_ring = PolyRing::zero();
     let mut curr_xd = Zq::one(); // Tracks (x^d)^i
-
     let num_chunks = N / d; // Number of polynomial chunks
+    // read the "NOTE:" in helpers section for mul_poly add_poly use
+    let start_y_eval = Instant::now();
     for i in 0..num_chunks {
         // Extract f_i chunk
         let chunk = &f_coeffs[i * d .. (i + 1) * d];
@@ -455,10 +428,13 @@ pub fn eval_prover(
         // Update (x^d)^i for the next loop iteration
         curr_xd = curr_xd * x_d;
     }
+    println!("  [TIMER] Prover evaluation of y_val took: {:?}", start_y_eval.elapsed());
 
-    // --- Eval.P line 6: a^T = [1, x^d, x^{2d}, ..., x^{(m-1)d}] ⊗ G_{b0,m} ---
-    // a^T has length delta0 * m. For each column j of the coefficient matrix,
-    // a_host[j * DELTA0 + k] = x^{j*d} * b0^k  (the Kronecker with the decomposition basis).
+    // Line 6. Note that the below loop simulates the gadget matrix multiplication. This is because only a part of the Kronecker
+    // product matrix is relevant in G_{b0,m}. Specifically, we dot product 1 with the g matrix, then x^d, then x^2d ...
+    // Another question that might arise is why coeffs is a zq vector instead of a single element zq. The answer is that
+    // we are still working with polynomial rings, and even though every other element except the first one is zero, 
+    // we still need the other elements to be there and be zero in order to have a ring.
     let x_d = {
         let mut xd = Zq::one();
         for _ in 0..d { xd = xd * *x_scalar; }
@@ -466,19 +442,20 @@ pub fn eval_prover(
     };
     let mut a_host = vec![PolyRing::zero(); DELTA0 * M];
     let mut x_jd = Zq::one(); // x^{j*d}
+    let start_a_host = Instant::now();
     for j in 0..M {
         let mut b0_pow = Zq::one(); // b0^k
         for k in 0..DELTA0 {
             let mut coeffs = vec![Zq::zero(); d];
             coeffs[0] = x_jd * b0_pow;
-            // FIXED: ICICLE's balanced_decomposition is Digit-First: idx = digit_k * M + element_j
             a_host[k * M + j] = PolyRing::from_slice(&coeffs).unwrap();
             b0_pow = b0_pow * Zq::from((1 << B0) as u32);
         }
         x_jd = x_jd * x_d;
     }
+    println!("  [TIMER] Prover computing a_host took: {:?}", start_a_host.elapsed());
 
-    // --- Eval.P line 7: b^T = [1, x^{md}, x^{2md}, ..., x^{(r-1)md}] ---
+    // Line 7: b^T
     let x_md = {
         let mut xmd = Zq::one();
         for _ in 0..(M * d) { xmd = xmd * *x_scalar; }
@@ -493,9 +470,8 @@ pub fn eval_prover(
         x_imd = x_imd * x_md;
     }
 
-    // --- Eval.P line 8: w^T = a^T [s_1 | ... | s_r] ---
+    // Line 8: w^T = a^T [s_1 | ... | s_r]
     // w[i] = ⟨a, s_i⟩
-    // To avoid OOM, use a loop for dot products instead of a giant matmul
     let mut a_dev = DeviceVec::from_host_slice(&a_host);
     let ntt_cfg = negacyclic_ntt::NegacyclicNttConfig::default();
     negacyclic_ntt::ntt_inplace(&mut a_dev, NTTDir::kForward, &ntt_cfg)?;
@@ -504,14 +480,15 @@ pub fn eval_prover(
     let mut tmp_dot = DeviceVec::<PolyRing>::device_malloc(1)?;
     let mut s_i_dev = DeviceVec::<PolyRing>::device_malloc(DELTA0 * M)?;
     println!("  [DEBUG] Starting w-reduction loop, R={}", R);
+    let start_w_reduction = Instant::now();
     for i in 0..R {
         if i % 50 == 0 { println!("  [DEBUG] w-reduction iteration {}", i); }
         s_i_dev.copy_from_host(HostSlice::from_slice(&commit_return.s[i]))?;
         negacyclic_ntt::ntt_inplace(&mut s_i_dev, NTTDir::kForward, &ntt_cfg)?;
         
         matrix_ops::matmul::<PolyRing>(
-            &s_i_dev, 1, (DELTA0 * M) as u32,
-            &a_dev, (DELTA0 * M) as u32, 1,
+            &a_dev, 1, (DELTA0 * M) as u32,        // a^T is 1 x K
+            &s_i_dev, (DELTA0 * M) as u32, 1,      // s_i is K x 1
             &MatMulConfig::default(),
             &mut tmp_dot,
         )?;
@@ -522,16 +499,17 @@ pub fn eval_prover(
         w_host.push(res[0]);
     }
     println!("  [DEBUG] w-reduction loop finished.");
+    println!("  [TIMER] Prover w-reduction took: {:?}", start_w_reduction.elapsed());
     let w_dev = DeviceVec::from_host_slice(&w_host);
 
-    // --- Eval.P line 9: w_hat = G^{-1}_{b,r}(w) ---
+    // Line 9: w_hat = G^{-1}_{b,r}(w)
     let w_hat_len = DELTA * R;
     let mut w_hat = DeviceVec::<PolyRing>::device_malloc(w_hat_len)?;
     balanced_decomposition::decompose::<PolyRing>(
         &w_dev[..], &mut w_hat[..], (1 << B1) as u32, &cfg,
     )?;
 
-    // --- Eval.P line 10: v = D · w_hat ---
+    // Line 10: v = D · w_hat
     let mut v_dev = DeviceVec::<PolyRing>::device_malloc(NROWS)?;
     matrix_ops::matmul::<PolyRing>(
         &pp.D, NROWS as u32, D_COLS as u32,
@@ -541,7 +519,10 @@ pub fn eval_prover(
     let mut v_host = vec![PolyRing::zero(); NROWS];
     v_dev.copy_to_host(HostSlice::from_mut_slice(&mut v_host))?;
 
-    // --- FIAT SHAMIR CHALLENGE ---
+    let mut w_hat_host = vec![PolyRing::zero(); w_hat_len];
+    w_hat.copy_to_host(HostSlice::from_mut_slice(&mut w_hat_host))?;
+
+    // FIAT SHAMIR CHALLENGE (line 12)
     let domain_sep = DomainSeparator::new(FiatShamirGreyhound::protocol_id())
         .session(spongefish::session!("greyhound_pcs"))
         .instance(&[0u8; 0]);
@@ -553,71 +534,66 @@ pub fn eval_prover(
     let mut c_host = vec![PolyRing::zero(); R];
     c.copy_to_host(HostSlice::from_mut_slice(&mut c_host))?;
 
-    // --- Eval.P line 13: z = Σ_{i=1}^{r} c_i · s_i ---
-    // Compute on GPU using a single vector accumulator for memory efficiency
+    // Lines 14 - 17
+    // Build Labrador witness from the composited z_full blocks
     let z_len = DELTA0 * M;
-    let mut z_dev = DeviceVec::<PolyRing>::device_malloc(z_len)?;
-    let mut z_acc = DeviceVec::<PolyRing>::device_malloc(z_len)?;
-    let cfg_zero = VecOpsConfig::default();
-    let zeros = vec![PolyRing::zero(); z_len];
-    z_dev.copy_from_host(HostSlice::from_slice(&zeros))?;
-    
-    println!("  [DEBUG] Starting z-folding loop, R={}, z_len={}", R, z_len);
-    let mut term = DeviceVec::<PolyRing>::device_malloc(z_len)?;
-    let mut s_i_dev = DeviceVec::<PolyRing>::device_malloc(z_len)?;
-    let mut c_i_dev = DeviceVec::<PolyRing>::device_malloc(1)?;
-
+    let w_len = DELTA;
+    let t_len = NROWS * DELTA;
+    let mut z_full: Vec<Vec<PolyRing>> = Vec::with_capacity(R);
+    let start_z_full_pack = Instant::now();
     for i in 0..R {
-        if i % 50 == 0 { println!("  [DEBUG] z-folding iteration {}", i); }
-        s_i_dev.copy_from_host(HostSlice::from_slice(&commit_return.s[i]))?;
-        c_i_dev.copy_from_host(HostSlice::from_slice(&[c_host[i]]))?;
+        let mut block = Vec::with_capacity(w_len + t_len + z_len);
         
-        negacyclic_ntt::ntt_inplace(&mut s_i_dev, NTTDir::kForward, &ntt_cfg)?;
-        negacyclic_ntt::ntt_inplace(&mut c_i_dev, NTTDir::kForward, &ntt_cfg)?;
+        // Gather the interleaved digits for the witness block
+        let mut w_hat_i = vec![PolyRing::zero(); DELTA];
+        for k in 0..DELTA {
+            w_hat_i[k] = w_hat_host[k * R + i];
+        }
+        block.extend_from_slice(&w_hat_i);
         
-        matrix_ops::matmul::<PolyRing>(
-            &c_i_dev, 1, 1,
-            &s_i_dev, 1, z_len as u32,
-            &MatMulConfig::default(),
-            &mut term,
-        )?;
-        
-        icicle_core::vec_ops::poly_vecops::polyvec_add::<PolyRing>(
-            &z_dev, 
-            &term, 
-            &mut z_acc, 
-            &cfg_zero
-        )?;
-        // Swap or copy back. ICICLE DeviceVec doesn't support easy swap, so copy.
-        // Actually, let's just use z_dev = z_acc which is a pointer swap if DeviceVec implements Move.
-        z_dev = z_acc;
-        // Re-allocate or just keep z_dev and z_acc.
-        // Wait, z_dev = z_acc consumes z_acc. We need a way to reuse.
-        // I'll just use a manual copy for safety if I can't swap pointers.
-        z_acc = DeviceVec::<PolyRing>::device_malloc(z_len)?;
+        let t_start = i * t_len;
+        block.extend_from_slice(&commit_return.t_hat_concat[t_start..t_start + t_len]);
+        block.extend_from_slice(&commit_return.s[i]);
+        z_full.push(block);
     }
-    println!("  [DEBUG] z-folding loop finished.");
+    println!("  [TIMER] Prover packing z_full blocks took: {:?}", start_z_full_pack.elapsed());
     
-    negacyclic_ntt::ntt_inplace(&mut z_dev, NTTDir::kInverse, &ntt_cfg)?;
-    let mut z_host = vec![PolyRing::zero(); z_len];
-    z_dev.copy_to_host(HostSlice::from_mut_slice(&mut z_host))?;
-    println!("  [DEBUG] z ntt finished.");
+    // Build the constraint system: P matrix components + target h
+    let constraint = labrador::ConstraintSystem {
+        a_eval: a_host.clone(),
+        b_eval: b_host.clone(),
+        sigma_inv_x: sigma_inv_x,
+        A_ajtai: {
+            let mut A_h = vec![PolyRing::zero(); pp.A.len()];
+            pp.A.copy_to_host(HostSlice::from_mut_slice(&mut A_h))?;
+            A_h
+        },
+        h_target: {
+            let mut h = Vec::new();
+            h.extend_from_slice(&v_host);         // v (NROWS)
+            h.extend_from_slice(&commit_return.u); // u (NROWS)
+            h.push(y_ring);                        // sigma^{-1}(x)^{-1} * y (1)
+            h.push(PolyRing::zero());              // 0 (1) 
+            h
+        },
+        n_w: w_len,
+        n_t: t_len,
+        n_s: z_len,
+        n_commit: NROWS,
+    };
 
-    // --- Eval.P lines 14-17: Construct Labrador instance and prove ---
-    // Build Labrador witness from the s vectors
     let lab_witness = labrador::LabradorWitness {
-        s: commit_return.s.clone(),
+        s: z_full,
     };
     println!("  [DEBUG] Labrador witness finished.");
 
     // Run Labrador prover (using shared CRS)
-    let (labrador_proof, labrador_transcript) = labrador::labrador_prove(lab_crs, &lab_witness)?;
+    let (labrador_proof, labrador_transcript) = labrador::labrador_prove(lab_crs, &lab_witness, &constraint)?;
     println!("  [DEBUG] Labrador prove finished.");
     Ok(ProverProof {
         y: y_ring,
         v: v_host,
         narg_transcript,
-        z: z_host,
         labrador_proof,
         labrador_transcript,
     })
@@ -636,8 +612,6 @@ pub fn eval_verifier(
     lab_crs: &labrador::LabradorCRS,
 ) -> Result<bool, IcicleError> {
     let d = PolyRing::DEGREE;
-    let _cfg = VecOpsConfig::default();
-    let matcfg = MatMulConfig::default();
 
     // 1. Recover challenge vector c via Fiat-Shamir
     let domain_sep = DomainSeparator::new(FiatShamirGreyhound::protocol_id())
@@ -649,7 +623,17 @@ pub fn eval_verifier(
     let mut c_host = vec![PolyRing::zero(); R];
     c.copy_to_host(HostSlice::from_mut_slice(&mut c_host))?;
 
-    // 2. Recompute a^T from x_scalar
+    // 2. Check ct(y) == f(x)
+    let f_coeffs: Vec<Zq> = raw_f_coeffs.iter().map(|&val| Zq::from(val as u32)).collect();
+    let ct_y = constant_term(&proof.y);
+    let f_x = evaluate_polynomial(&f_coeffs, x_scalar);
+    if !zq_equal(&ct_y, &f_x) {
+        println!("  [FAIL] Check 1: ct(y) != f(x)");
+        return Ok(false);
+    }
+    println!("  [PASS] Check 1: ct(y) == f(x)");
+
+    // 3. Rebuild the constraint system from public info
     let x_d = {
         let mut xd = Zq::one();
         for _ in 0..d { xd = xd * *x_scalar; }
@@ -662,115 +646,82 @@ pub fn eval_verifier(
         for k in 0..DELTA0 {
             let mut coeffs = vec![Zq::zero(); d];
             coeffs[0] = x_jd * b0_pow;
-            a_host[j * DELTA0 + k] = PolyRing::from_slice(&coeffs).unwrap();
+            a_host[k * M + j] = PolyRing::from_slice(&coeffs).unwrap();
             b0_pow = b0_pow * Zq::from((1 << B0) as u32);
         }
         x_jd = x_jd * x_d;
     }
-
-    // 3. Check: A · z == Σ c_i · t_hat_i (commitment consistency)
-    let ntt_cfg = negacyclic_ntt::NegacyclicNttConfig::default();
-
-    // NTT transform A and z for fast Ajtai check
-    let mut A_ntt = DeviceVec::<PolyRing>::device_malloc(pp.A.len())?;
-    negacyclic_ntt::ntt(&pp.A, NTTDir::kForward, &ntt_cfg, &mut A_ntt[..])?;
-
-    let mut z_dev = DeviceVec::from_host_slice(&proof.z);
-    negacyclic_ntt::ntt_inplace(&mut z_dev, NTTDir::kForward, &ntt_cfg)?;
-
-    let mut Az_ntt = DeviceVec::<PolyRing>::device_malloc(NROWS)?;
-    matrix_ops::matmul::<PolyRing>(
-        &A_ntt, NROWS as u32, A_COLS as u32,
-        &z_dev, A_COLS as u32, 1,
-        &MatMulConfig::default(),
-        &mut Az_ntt,
-    )?;
-
-    negacyclic_ntt::ntt_inplace(&mut Az_ntt, NTTDir::kInverse, &ntt_cfg)?;
-    let mut Az_host = vec![PolyRing::zero(); NROWS];
-    Az_ntt.copy_to_host(HostSlice::from_mut_slice(&mut Az_host))?;
-
-    // Recompose and aggregate: RHS = Σ c_i · t_i = Σ c_i · (Σ hat_t_{i,j} · B1^j)
-    // We'll compute this on GPU as a matrix multiplication: w^T * t_hat_matrix
-    let mut t_hat_concat_ntt = DeviceVec::from_host_slice(&commit_return.t_hat_concat);
-    negacyclic_ntt::ntt_inplace(&mut t_hat_concat_ntt, NTTDir::kForward, &ntt_cfg)?;
-    
-    // Prepare weights w_{i,j} = c_i(X) * B1^j
-    let mut weights_host = vec![PolyRing::zero(); R * DELTA];
+    let x_md = {
+        let mut xmd = Zq::one();
+        for _ in 0..(M * d) { xmd = xmd * *x_scalar; }
+        xmd
+    };
+    let mut b_host = vec![PolyRing::zero(); R];
+    let mut x_imd = Zq::one();
     for i in 0..R {
-        let mut b1_pow = Zq::one();
-        for j in 0..DELTA {
-            // w_ij(X) = c_i(X) * B1^j
-            let mut w_coeffs = Vec::with_capacity(d);
-            let c_i_coeffs = unsafe { std::slice::from_raw_parts(&c_host[i] as *const _ as *const Zq, d) };
-            for k in 0..d {
-                w_coeffs.push(c_i_coeffs[k] * b1_pow);
-            }
-            weights_host[i * DELTA + j] = PolyRing::from_slice(&w_coeffs).unwrap();
-            b1_pow = b1_pow * Zq::from((1 << B1) as u32);
+        let mut coeffs = vec![Zq::zero(); d];
+        coeffs[0] = x_imd;
+        b_host[i] = PolyRing::from_slice(&coeffs).unwrap();
+        x_imd = x_imd * x_md;
+    }
+    let mut sigma_x_coeffs = vec![Zq::zero(); d];
+    {
+        let mut x_powers = vec![Zq::zero(); d];
+        let mut curr_x = Zq::one();
+        for j in 0..d {
+            x_powers[j] = curr_x;
+            curr_x = curr_x * *x_scalar;
+        }
+        sigma_x_coeffs[0] = x_powers[0];
+        for j in 1..d {
+            sigma_x_coeffs[j] = Zq::zero() - x_powers[d - j];
         }
     }
-    let mut weights_dev = DeviceVec::from_host_slice(&weights_host);
-    negacyclic_ntt::ntt_inplace(&mut weights_dev, NTTDir::kForward, &ntt_cfg)?;
-    
-    // t_hat_concat_dev is (R*DELTA) x NROWS in row-major
-    // weights_dev is 1 x (R*DELTA) row-vector
-    // Result is 1 x NROWS
-    let mut rhs_dev = DeviceVec::<PolyRing>::device_malloc(NROWS)?;
-    matrix_ops::matmul::<PolyRing>(
-        &weights_dev, 1, (R * DELTA) as u32,
-        &t_hat_concat_ntt, (R * DELTA) as u32, NROWS as u32,
-        &MatMulConfig::default(),
-        &mut rhs_dev,
-    )?;
-    
-    negacyclic_ntt::ntt_inplace(&mut rhs_dev, NTTDir::kInverse, &ntt_cfg)?;
-    let mut rhs = vec![PolyRing::zero(); NROWS];
-    rhs_dev.copy_to_host(HostSlice::from_mut_slice(&mut rhs))?;
+    let sigma_inv_x = PolyRing::from_slice(&sigma_x_coeffs).unwrap();
 
-    // Check Az == rhs
-    for i in 0..NROWS {
-        let az_item = Az_host[i];
-        let rhs_item = rhs[i];
-        let az_bytes = unsafe { std::slice::from_raw_parts(&az_item as *const _ as *const u64, d) };
-        let rhs_bytes = unsafe { std::slice::from_raw_parts(&rhs_item as *const _ as *const u64, d) };
-        if !poly_bytes_equal(&az_item, &rhs_item) {
-            println!("  [FAIL] Check 3: Az != Σ c_i·t_i at row {}", i);
-            println!("    Az[{}] = 0x{:x}, rhs[{}] = 0x{:x}", i, az_bytes[0], i, rhs_bytes[0]);
-            return Ok(false);
-        }
-    }
-    println!("  [PASS] Check 3: Az == Σ c_i·t_i");
+    let constraint = labrador::ConstraintSystem {
+        a_eval: a_host,
+        b_eval: b_host,
+        sigma_inv_x,
+        A_ajtai: {
+            let mut A_h = vec![PolyRing::zero(); pp.A.len()];
+            pp.A.copy_to_host(HostSlice::from_mut_slice(&mut A_h))?;
+            A_h
+        },
+        h_target: {
+            let mut h = Vec::new();
+            h.extend_from_slice(&proof.v);          // v (NROWS)
+            h.extend_from_slice(&commit_return.u);  // u (NROWS)
+            h.push(proof.y);                         // sigma^{-1}(x)^{-1} * y (1)
+            h.push(PolyRing::zero());                // 0 (1)
+            h
+        },
+        n_w: DELTA,
+        n_t: NROWS * DELTA,
+        n_s: DELTA0 * M,
+        n_commit: NROWS,
+    };
 
-    // 4. Check ct(y) == f(x)
-    let f_coeffs: Vec<Zq> = raw_f_coeffs.iter().map(|&val| Zq::from(val as u32)).collect();
-    let ct_y = constant_term(&proof.y);
-    let f_x = evaluate_polynomial(&f_coeffs, x_scalar);
-    if !zq_equal(&ct_y, &f_x) {
-        println!("  [FAIL] Check 4: ct(y) != f(x)");
-        return Ok(false);
-    }
-    println!("  [PASS] Check 4: ct(y) == f(x)");
-
-    // 5. Run Labrador Verifier (using shared CRS)
-    //TODO: ADD GREYHOUND C AND Z!!!!!!!!!!!
+    // 4. Run Labrador Verifier — all SIS checks are inside
     let lab_ok = labrador::labrador_verify(
-        lab_crs, 
-        &proof.labrador_proof, 
+        lab_crs,
+        &proof.labrador_proof,
         &proof.labrador_transcript,
-        &c_host,   // Passing Greyhound's c down
-        &proof.z   // Passing Greyhound's z down
+        &constraint,
     )?;
     if !lab_ok {
-        println!("  [FAIL] Check 5: Labrador verification failed");
+        println!("  [FAIL] Check 2: Labrador verification failed");
         return Ok(false);
     }
-    println!("  [PASS] Check 5: Labrador verification passed");
+    println!("  [PASS] Check 2: Labrador verification passed");
 
     Ok(true)
 }
 
-// Helpers for PolyRing arithmetic since we removed + and * operators in previous task.
+// Helpers
+// NOTE: notice that these functions are called ONLY ONCE on single polynomials. That is, polynomials
+// of degree d. Which means we only have a single polyring of 64 coefficients. I figure that in this case it is much
+// faster to just do the operations on cpu directly.
 fn add_poly(a: &PolyRing, b: &PolyRing) -> PolyRing {
     let d = PolyRing::DEGREE;
     let a_bytes = unsafe { std::slice::from_raw_parts(a as *const _ as *const Zq, d) };
@@ -799,13 +750,6 @@ fn mul_poly(a: &PolyRing, b: &PolyRing) -> PolyRing {
     PolyRing::from_slice(&res_coeffs).unwrap()
 }
 
-fn poly_bytes_equal(a: &PolyRing, b: &PolyRing) -> bool {
-    let size = std::mem::size_of::<PolyRing>();
-    let a_bytes = unsafe { std::slice::from_raw_parts(a as *const _ as *const u8, size) };
-    let b_bytes = unsafe { std::slice::from_raw_parts(b as *const _ as *const u8, size) };
-    a_bytes == b_bytes
-}
-
 fn zq_equal(a: &Zq, b: &Zq) -> bool {
     let size = std::mem::size_of::<Zq>();
     let a_bytes = unsafe { std::slice::from_raw_parts(a as *const _ as *const u8, size) };
@@ -816,24 +760,33 @@ fn zq_equal(a: &Zq, b: &Zq) -> bool {
 fn main() {
     println!("Loading default backend and initializing device...");
     let _ = icicle_runtime::runtime::load_backend("/workspace/icicle").unwrap();
-    let device = icicle_runtime::Device::new("CUDA", 0);    icicle_runtime::set_device(&device).unwrap();
+    let device = icicle_runtime::Device::new("CUDA", 0);
+    // let device = icicle_runtime::Device::new("CUDA", 0);
+    icicle_runtime::set_device(&device).unwrap();
 
     println!("Setting up Greyhound parameters: M={}, R={}", M, R);
     let pp = setup();
 
+    // Calculate the theoretical squared norm bound (\bar{\gamma}^2) exactly as defined in Greyhound Step 16
+    let d_f64 = PolyRing::DEGREE as f64;
+    let b0_f64 = (1u64 << B0) as f64;
+    let b1_f64 = (1u64 << B1) as f64;
+    let kappa = 51.0; // Typical l1 norm bound for a Fiat-Shamir challenge polynomial
+
+    let term1 = b1_f64.powi(2) * (NROWS as f64 + 1.0) * (DELTA as f64) * (R as f64) * d_f64;
+    let term2 = ((R as f64) * kappa * b0_f64).powi(2) * (DELTA0 as f64) * (M as f64) * d_f64;
+    let gamma_bar_sq = term1 + term2;
+
+    println!("Setting up Labrador CRS with theoretical norm bound sq: {:.2e}", gamma_bar_sq);
+
     // Create shared Labrador CRS
-    let mut lab_crs = labrador::LabradorCRS::setup(
+    let lab_crs = labrador::LabradorCRS::setup(
         R, DELTA0 * M,
         NROWS, N1, N1,
         DELTA, DELTA,
         (1 << B1) as u32, (1 << B1) as u32, (1 << B0) as u32, // b, b1, b2
-        //TODO: im pumping the norm check of 1e10 to 1e15 just to see if it works.
-        1, 1, 1e15,
+        1, 1, gamma_bar_sq,
     );
-    // UNIFY: Ensure Labrador's A matrix is the same as Greyhound's A matrix
-    let mut A_host = vec![PolyRing::zero(); A_COLS * NROWS];
-    pp.A.copy_to_host(HostSlice::from_mut_slice(&mut A_host)).expect("A copy failed");
-    lab_crs.A = A_host;
 
     let poly_size = N;
     let raw_f_coeffs: Vec<u64> = (0..poly_size).map(|i| (i % 100) as u64).collect();
@@ -841,8 +794,10 @@ fn main() {
     println!("Committing to function size {} elements...", poly_size);
     let commit_ret = commit(&raw_f_coeffs, &pp).expect("Commit failed");
 
-    let x_eval = Zq::from(7u32); 
-    println!("Running prover evaluation at x=7...");
+    let mut rng = rand::thread_rng();
+    let x_random_value : u32 = rng.r#gen::<u32>();
+    let x_eval = Zq::from(x_random_value); 
+    println!("Running prover evaluation at x= {} ...", x_random_value);
 
     let proof = eval_prover(&pp, &raw_f_coeffs, &commit_ret, &x_eval, &lab_crs).expect("Prover failed");
     
@@ -855,4 +810,3 @@ fn main() {
         println!("Verifier REJECTED the proof!");
     }
 }
-
