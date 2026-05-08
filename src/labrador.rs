@@ -79,24 +79,32 @@ use rand_chacha::ChaCha20Rng;
         pub a_eval: Vec<PolyRing>,
         /// Evaluation vector b (R elements) 
         pub b_eval: Vec<PolyRing>,
+        /// Fiat-Shamir challenge vector c (R elements)
+        pub c_eval: Vec<PolyRing>,
         /// σ_{-1}(x) automorphism polynomial
         pub sigma_inv_x: PolyRing,
         /// Ajtai commitment matrix A (NROWS × DELTA0*M)
         pub A_ajtai: Vec<PolyRing>,
+        /// Greyhound commitment matrix B (NROWS × NROWS*DELTA*R)
+        pub B_commit: Vec<PolyRing>,
+        /// Greyhound commitment matrix D (NROWS × DELTA*R)
+        pub D_commit: Vec<PolyRing>,
         /// Target vector h = [v, u, σ⁻¹(x)⁻¹·y, 0, 0]
         pub h_target: Vec<PolyRing>,
-        /// Width of w_hat block per column
+        /// Width of the full w_hat block
         pub n_w: usize,
-        /// Width of t_hat block per column
+        /// Width of the full t_hat block
         pub n_t: usize,
-        /// Width of s block per column  
+        /// Width of the folded s/z block
         pub n_s: usize,
         /// Number of commitment rows
         pub n_commit: usize,
     }
 
     pub struct LabradorWitness {
-        /// The z_full blocks: z_full[i] = [w_hat_i, t_hat_i, s_i]
+        /// Greyhound line-15 witness z = [w_hat | t_hat | [s_1 | ... | s_r]c].
+        pub z: Vec<PolyRing>,
+        /// Legacy row-folded prototype witness; no longer used by the active verifier path.
         pub s: Vec<Vec<PolyRing>>,
     }
 
@@ -279,6 +287,182 @@ use rand_chacha::ChaCha20Rng;
         true
     }
 
+    fn scale_poly_host(a: &PolyRing, scalar: Zq) -> PolyRing {
+        let d = PolyRing::DEGREE;
+        let a_c = unsafe { std::slice::from_raw_parts(a as *const _ as *const Zq, d) };
+        let mut res = vec![Zq::zero(); d];
+        for i in 0..d {
+            res[i] = a_c[i] * scalar;
+        }
+        PolyRing::from_slice(&res).unwrap()
+    }
+
+    fn recompose_digit_major(
+        digits: &[PolyRing],
+        num_values: usize,
+        digit_count: usize,
+        base: u32,
+    ) -> Vec<PolyRing> {
+        assert_eq!(digits.len(), num_values * digit_count);
+        let mut recomposed = vec![PolyRing::zero(); num_values];
+        let mut b_pow = Zq::one();
+        let base_zq = Zq::from(base);
+
+        for k in 0..digit_count {
+            for i in 0..num_values {
+                let term = scale_poly_host(&digits[k * num_values + i], b_pow);
+                recomposed[i] = add_poly_host(&recomposed[i], &term);
+            }
+            b_pow = b_pow * base_zq;
+        }
+
+        recomposed
+    }
+
+    fn poly_vec_norm_sq(z: &[PolyRing]) -> f64 {
+        let d = PolyRing::DEGREE;
+        let mut total = 0.0;
+        for poly in z {
+            let coeffs = unsafe { std::slice::from_raw_parts(poly as *const _ as *const Zq, d) };
+            for coeff in coeffs {
+                let val = unsafe { *(coeff as *const _ as *const u32) };
+                let mag = if val > (1 << 30) {
+                    let neg = Zq::zero() - *coeff;
+                    unsafe { *(&neg as *const _ as *const u32) }
+                } else {
+                    val
+                };
+                let mag_f = mag as f64;
+                total += mag_f * mag_f;
+            }
+        }
+        total
+    }
+
+    fn verify_greyhound_pz(
+        crs: &LabradorCRS,
+        z: &[PolyRing],
+        constraint: &ConstraintSystem,
+    ) -> Result<bool, IcicleError> {
+        let n_w = constraint.n_w;
+        let n_t = constraint.n_t;
+        let n_s = constraint.n_s;
+        let n_commit = constraint.n_commit;
+        let r = constraint.c_eval.len();
+        let n_full = n_w + n_t + n_s;
+        let h_len = (3 * n_commit) + 2;
+        let _sigma_inv_x = &constraint.sigma_inv_x;
+
+        if z.len() != n_full {
+            println!("    [LAB FAIL] z length mismatch: got {}, expected {}", z.len(), n_full);
+            return Ok(false);
+        }
+        if constraint.h_target.len() != h_len {
+            println!("    [LAB FAIL] h length mismatch: got {}, expected {}", constraint.h_target.len(), h_len);
+            return Ok(false);
+        }
+        if r == 0 || n_w % r != 0 || n_t % r != 0 {
+            println!("    [LAB FAIL] invalid Greyhound block dimensions");
+            return Ok(false);
+        }
+        if constraint.b_eval.len() != r || constraint.a_eval.len() != n_s {
+            println!("    [LAB FAIL] Greyhound evaluation vector length mismatch");
+            return Ok(false);
+        }
+        if constraint.D_commit.len() != n_commit * n_w || constraint.B_commit.len() != n_commit * n_t {
+            println!("    [LAB FAIL] Greyhound commitment matrix length mismatch");
+            return Ok(false);
+        }
+
+        let z_w = &z[..n_w];
+        let z_t = &z[n_w..n_w + n_t];
+        let z_s = &z[n_w + n_t..];
+
+        let h_v = &constraint.h_target[..n_commit];
+        let h_u = &constraint.h_target[n_commit..2 * n_commit];
+        let h_y = &constraint.h_target[2 * n_commit];
+        let h_zero_scalar = &constraint.h_target[(2 * n_commit) + 1];
+        let h_zero_vec = &constraint.h_target[(2 * n_commit) + 2..];
+
+        let d_w = device_ntt_matmul(&constraint.D_commit, n_commit, n_w, z_w)?;
+        if !poly_vecs_equal(&d_w, h_v) {
+            println!("    [LAB FAIL] Check P.1: D*w_hat != v");
+            return Ok(false);
+        }
+        println!("    [LAB PASS] Check P.1: D*w_hat == v");
+
+        let b_t = device_ntt_matmul(&constraint.B_commit, n_commit, n_t, z_t)?;
+        if !poly_vecs_equal(&b_t, h_u) {
+            println!("    [LAB FAIL] Check P.2: B*t_hat != u");
+            return Ok(false);
+        }
+        println!("    [LAB PASS] Check P.2: B*t_hat == u");
+
+        let w_digits = n_w / r;
+        let w = recompose_digit_major(z_w, r, w_digits, crs.b);
+
+        let mut b_dot_w = PolyRing::zero();
+        for i in 0..r {
+            let term = mul_poly_host(&constraint.b_eval[i], &w[i]);
+            b_dot_w = add_poly_host(&b_dot_w, &term);
+        }
+        if !poly_equal(&b_dot_w, h_y) {
+            println!("    [LAB FAIL] Check P.3: b^T*G*w_hat != sigma^-1(x)^-1*y");
+            return Ok(false);
+        }
+        println!("    [LAB PASS] Check P.3: b^T*G*w_hat == sigma^-1(x)^-1*y");
+
+        let mut c_dot_w = PolyRing::zero();
+        for i in 0..r {
+            let term = mul_poly_host(&constraint.c_eval[i], &w[i]);
+            c_dot_w = add_poly_host(&c_dot_w, &term);
+        }
+        let mut a_dot_z = PolyRing::zero();
+        for j in 0..constraint.a_eval.len() {
+            let term = mul_poly_host(&constraint.a_eval[j], &z_s[j]);
+            a_dot_z = add_poly_host(&a_dot_z, &term);
+        }
+        let row4_expected = add_poly_host(&a_dot_z, h_zero_scalar);
+        if !poly_equal(&c_dot_w, &row4_expected) {
+            println!("    [LAB FAIL] Check P.4: c^T*G*w_hat - a^T*z != 0");
+            return Ok(false);
+        }
+        println!("    [LAB PASS] Check P.4: c^T*G*w_hat - a^T*z == 0");
+
+        let t_per_column = n_t / r;
+        if t_per_column % n_commit != 0 {
+            println!("    [LAB FAIL] invalid t_hat block width");
+            return Ok(false);
+        }
+        let t_digits = t_per_column / n_commit;
+        let mut c_dot_t = vec![PolyRing::zero(); n_commit];
+        for i in 0..r {
+            let t_i = recompose_digit_major(
+                &z_t[i * t_per_column..(i + 1) * t_per_column],
+                n_commit,
+                t_digits,
+                crs.b,
+            );
+            for row in 0..n_commit {
+                let term = mul_poly_host(&constraint.c_eval[i], &t_i[row]);
+                c_dot_t[row] = add_poly_host(&c_dot_t[row], &term);
+            }
+        }
+
+        let a_z = device_ntt_matmul(&constraint.A_ajtai, n_commit, n_s, z_s)?;
+        let mut row5_expected = Vec::with_capacity(n_commit);
+        for row in 0..n_commit {
+            row5_expected.push(add_poly_host(&a_z[row], &h_zero_vec[row]));
+        }
+        if !poly_vecs_equal(&c_dot_t, &row5_expected) {
+            println!("    [LAB FAIL] Check P.5: (c^T ⊗ G)*t_hat - A*z != 0");
+            return Ok(false);
+        }
+        println!("    [LAB PASS] Check P.5: (c^T ⊗ G)*t_hat - A*z == 0");
+
+        Ok(true)
+    }
+
     // CRS SETUP
 
     impl LabradorCRS {
@@ -335,6 +519,29 @@ use rand_chacha::ChaCha20Rng;
         constraint: &ConstraintSystem,
         prover_state: &mut ProverState,
     ) -> Result<LabradorProof, IcicleError> {
+        if witness.s.is_empty() {
+            let active_start = Instant::now();
+            let n_full = constraint.n_w + constraint.n_t + constraint.n_s;
+            if witness.z.len() != n_full {
+                println!("    [LAB FAIL] Prover witness z length mismatch: got {}, expected {}", witness.z.len(), n_full);
+            }
+            let norm_sq = poly_vec_norm_sq(&witness.z);
+            println!("  [TIMER] Labrador active Greyhound witness checks took: {:?}", active_start.elapsed());
+            println!("  [DEBUG] Labrador active witness norm sq: {:.4e} / {:.4e}", norm_sq, crs.norm_bound_sq);
+
+            return Ok(LabradorProof {
+                u_1: Vec::new(),
+                p: Vec::new(),
+                b_agg: Vec::new(),
+                u_2: Vec::new(),
+                z_folded: witness.z.clone(),
+                t_flat: Vec::new(),
+                G_flat: Vec::new(),
+                H_flat: Vec::new(),
+            });
+        }
+
+        // Legacy row-folding prototype kept below for reference while the port is in flux.
         let cfg = VecOpsConfig::default();
         let r = crs.r;
         let n_full = witness.s[0].len(); // 15875
@@ -616,6 +823,31 @@ use rand_chacha::ChaCha20Rng;
         verifier_state: &mut VerifierState,
         constraint: &ConstraintSystem,
     ) -> Result<bool, IcicleError> {
+        if proof.u_1.is_empty()
+            && proof.p.is_empty()
+            && proof.b_agg.is_empty()
+            && proof.u_2.is_empty()
+            && proof.t_flat.is_empty()
+            && proof.G_flat.is_empty()
+            && proof.H_flat.is_empty()
+        {
+            let n_full = constraint.n_w + constraint.n_t + constraint.n_s;
+            if proof.z_folded.len() != n_full {
+                println!("    [LAB FAIL] Check Norm: z length mismatch, got {}, expected {}", proof.z_folded.len(), n_full);
+                return Ok(false);
+            }
+
+            let norm_sq = poly_vec_norm_sq(&proof.z_folded);
+            if norm_sq > crs.norm_bound_sq {
+                println!("    [LAB FAIL] Check Norm: ||z||^2 = {:.4e} exceeds {:.4e}", norm_sq, crs.norm_bound_sq);
+                return Ok(false);
+            }
+            println!("    [LAB PASS] Check Norm: ||z||^2 within Greyhound bound");
+
+            return verify_greyhound_pz(crs, &proof.z_folded, constraint);
+        }
+
+        // Legacy row-folding verifier kept below for reference while the port is in flux.
         let cfg = VecOpsConfig::default();
         let r = crs.r;
         let d = PolyRing::DEGREE;
@@ -894,3 +1126,4 @@ use rand_chacha::ChaCha20Rng;
             Err(_) => Ok(false),
         }
     }
+
