@@ -109,6 +109,7 @@ use rand_chacha::ChaCha20Rng;
     }
 
     /// Labrador proof output from one round of the prover.
+    #[derive(Clone)]
     pub struct LabradorProof {
         pub u_1: Vec<PolyRing>,
         pub p: Vec<Zq>,
@@ -354,23 +355,23 @@ use rand_chacha::ChaCha20Rng;
         let _sigma_inv_x = &constraint.sigma_inv_x;
 
         if z.len() != n_full {
-            println!("    [LAB FAIL] z length mismatch: got {}, expected {}", z.len(), n_full);
+            // println!("    [LAB FAIL] z length mismatch: got {}, expected {}", z.len(), n_full);
             return Ok(false);
         }
         if constraint.h_target.len() != h_len {
-            println!("    [LAB FAIL] h length mismatch: got {}, expected {}", constraint.h_target.len(), h_len);
+            // println!("    [LAB FAIL] h length mismatch: got {}, expected {}", constraint.h_target.len(), h_len);
             return Ok(false);
         }
         if r == 0 || n_w % r != 0 || n_t % r != 0 {
-            println!("    [LAB FAIL] invalid Greyhound block dimensions");
+            // println!("    [LAB FAIL] invalid Greyhound block dimensions");
             return Ok(false);
         }
         if constraint.b_eval.len() != r || constraint.a_eval.len() != n_s {
-            println!("    [LAB FAIL] Greyhound evaluation vector length mismatch");
+            // println!("    [LAB FAIL] Greyhound evaluation vector length mismatch");
             return Ok(false);
         }
         if constraint.D_commit.len() != n_commit * n_w || constraint.B_commit.len() != n_commit * n_t {
-            println!("    [LAB FAIL] Greyhound commitment matrix length mismatch");
+            // println!("    [LAB FAIL] Greyhound commitment matrix length mismatch");
             return Ok(false);
         }
 
@@ -386,17 +387,17 @@ use rand_chacha::ChaCha20Rng;
 
         let d_w = device_ntt_matmul(&constraint.D_commit, n_commit, n_w, z_w)?;
         if !poly_vecs_equal(&d_w, h_v) {
-            println!("    [LAB FAIL] Check P.1: D*w_hat != v");
+            // println!("    [LAB FAIL] Check P.1: D*w_hat != v");
             return Ok(false);
         }
-        println!("    [LAB PASS] Check P.1: D*w_hat == v");
+        // println!("    [LAB PASS] Check P.1: D*w_hat == v");
 
         let b_t = device_ntt_matmul(&constraint.B_commit, n_commit, n_t, z_t)?;
         if !poly_vecs_equal(&b_t, h_u) {
-            println!("    [LAB FAIL] Check P.2: B*t_hat != u");
+            // println!("    [LAB FAIL] Check P.2: B*t_hat != u");
             return Ok(false);
         }
-        println!("    [LAB PASS] Check P.2: B*t_hat == u");
+        // println!("    [LAB PASS] Check P.2: B*t_hat == u");
 
         let w_digits = n_w / r;
         let w = recompose_digit_major(z_w, r, w_digits, crs.b);
@@ -407,10 +408,10 @@ use rand_chacha::ChaCha20Rng;
             b_dot_w = add_poly_host(&b_dot_w, &term);
         }
         if !poly_equal(&b_dot_w, h_y) {
-            println!("    [LAB FAIL] Check P.3: b^T*G*w_hat != sigma^-1(x)^-1*y");
+            // println!("    [LAB FAIL] Check P.3: b^T*G*w_hat != sigma^-1(x)^-1*y");
             return Ok(false);
         }
-        println!("    [LAB PASS] Check P.3: b^T*G*w_hat == sigma^-1(x)^-1*y");
+        // println!("    [LAB PASS] Check P.3: b^T*G*w_hat == sigma^-1(x)^-1*y");
 
         let mut c_dot_w = PolyRing::zero();
         for i in 0..r {
@@ -424,14 +425,14 @@ use rand_chacha::ChaCha20Rng;
         }
         let row4_expected = add_poly_host(&a_dot_z, h_zero_scalar);
         if !poly_equal(&c_dot_w, &row4_expected) {
-            println!("    [LAB FAIL] Check P.4: c^T*G*w_hat - a^T*z != 0");
+            // println!("    [LAB FAIL] Check P.4: c^T*G*w_hat - a^T*z != 0");
             return Ok(false);
         }
-        println!("    [LAB PASS] Check P.4: c^T*G*w_hat - a^T*z == 0");
+        // println!("    [LAB PASS] Check P.4: c^T*G*w_hat - a^T*z == 0");
 
         let t_per_column = n_t / r;
         if t_per_column % n_commit != 0 {
-            println!("    [LAB FAIL] invalid t_hat block width");
+            // println!("    [LAB FAIL] invalid t_hat block width");
             return Ok(false);
         }
         let t_digits = t_per_column / n_commit;
@@ -455,10 +456,10 @@ use rand_chacha::ChaCha20Rng;
             row5_expected.push(add_poly_host(&a_z[row], &h_zero_vec[row]));
         }
         if !poly_vecs_equal(&c_dot_t, &row5_expected) {
-            println!("    [LAB FAIL] Check P.5: (c^T ⊗ G)*t_hat - A*z != 0");
+            // println!("    [LAB FAIL] Check P.5: (c^T ⊗ G)*t_hat - A*z != 0");
             return Ok(false);
         }
-        println!("    [LAB PASS] Check P.5: (c^T ⊗ G)*t_hat - A*z == 0");
+        // println!("    [LAB PASS] Check P.5: (c^T ⊗ G)*t_hat - A*z == 0");
 
         Ok(true)
     }
@@ -520,14 +521,20 @@ use rand_chacha::ChaCha20Rng;
         prover_state: &mut ProverState,
     ) -> Result<LabradorProof, IcicleError> {
         if witness.s.is_empty() {
-            let active_start = Instant::now();
+            let _active_start = Instant::now();
             let n_full = constraint.n_w + constraint.n_t + constraint.n_s;
             if witness.z.len() != n_full {
-                println!("    [LAB FAIL] Prover witness z length mismatch: got {}, expected {}", witness.z.len(), n_full);
+                // println!("    [LAB FAIL] Prover witness z length mismatch: got {}, expected {}", witness.z.len(), n_full);
             }
             let norm_sq = poly_vec_norm_sq(&witness.z);
-            println!("  [TIMER] Labrador active Greyhound witness checks took: {:?}", active_start.elapsed());
-            println!("  [DEBUG] Labrador active witness norm sq: {:.4e} / {:.4e}", norm_sq, crs.norm_bound_sq);
+            if norm_sq > crs.norm_bound_sq {
+                return Err(IcicleError::new(
+                    icicle_runtime::errors::eIcicleError::InvalidArgument,
+                    "Labrador active witness norm exceeds Greyhound bound",
+                ));
+            }
+            // println!("  [TIMER] Labrador active Greyhound witness checks took: {:?}", active_start.elapsed());
+            // println!("  [DEBUG] Labrador active witness norm sq: {:.4e} / {:.4e}", norm_sq, crs.norm_bound_sq);
 
             return Ok(LabradorProof {
                 u_1: Vec::new(),
@@ -833,16 +840,16 @@ use rand_chacha::ChaCha20Rng;
         {
             let n_full = constraint.n_w + constraint.n_t + constraint.n_s;
             if proof.z_folded.len() != n_full {
-                println!("    [LAB FAIL] Check Norm: z length mismatch, got {}, expected {}", proof.z_folded.len(), n_full);
+                // println!("    [LAB FAIL] Check Norm: z length mismatch, got {}, expected {}", proof.z_folded.len(), n_full);
                 return Ok(false);
             }
 
             let norm_sq = poly_vec_norm_sq(&proof.z_folded);
             if norm_sq > crs.norm_bound_sq {
-                println!("    [LAB FAIL] Check Norm: ||z||^2 = {:.4e} exceeds {:.4e}", norm_sq, crs.norm_bound_sq);
+                // println!("    [LAB FAIL] Check Norm: ||z||^2 = {:.4e} exceeds {:.4e}", norm_sq, crs.norm_bound_sq);
                 return Ok(false);
             }
-            println!("    [LAB PASS] Check Norm: ||z||^2 within Greyhound bound");
+            // println!("    [LAB PASS] Check Norm: ||z||^2 within Greyhound bound");
 
             return verify_greyhound_pz(crs, &proof.z_folded, constraint);
         }
